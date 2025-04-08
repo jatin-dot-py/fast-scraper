@@ -6,9 +6,11 @@ import random
 from pydantic import BaseModel
 import time
 import logging
-from urllib.parse import urlparse
 import os
-from app.config import get_proxy_list, get_settings
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -28,46 +30,56 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
 ]
 
-async def scrape_url(url: str, max_retries: int = 3, timeout: int = 30, proxy_type: str = "datacenter") -> Dict[str, Any]:
+# Get proxy list from environment
+def get_proxy_list():
+    """Get datacenter proxies from environment variable."""
+    proxies_str = os.getenv("DATACENTER_PROXIES", "")
+    if not proxies_str:
+        logger.warning("No proxies configured in DATACENTER_PROXIES environment variable.")
+        return []
+    
+    # Split by comma
+    return [proxy.strip() for proxy in proxies_str.split(",") if proxy.strip()]
+
+async def scrape_url(url: str, max_retries: int = 3, timeout: int = 30) -> Dict[str, Any]:
     """Scrape a single URL with retry logic."""
     start_time = time.time()
     
     # Rotate user agent
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     
-    # Get a random proxy (always use datacenter proxies regardless of what was requested)
-    proxies = get_proxy_list("datacenter")
+    # Get proxies
+    proxies = get_proxy_list()
     if not proxies:
-        logger.warning("No proxies configured. Proceeding without proxy.")
-        proxy = None
+        logger.warning(f"No proxies configured. Proceeding without proxy for {url}")
+        proxy_url = None
     else:
-        # Format proxy for httpx
+        # Get a random proxy
         proxy_url = random.choice(proxies)
-        proxy = {
-            "http://": proxy_url,
-            "https://": proxy_url
-        }
+        logger.info(f"Using proxy {proxy_url} for {url}")
     
-    # Extract domain for per-domain rate limiting
-    domain = urlparse(url).netloc
-    
-    # Try to use HTTP/2 for better performance
+    # Try to fetch the URL with retries
     for attempt in range(max_retries):
         try:
-            # Create a client with HTTP/2 support
-            limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-            async with httpx.AsyncClient(
-                http2=True,
-                limits=limits,
-                proxies=proxy,
-                timeout=timeout,
-                follow_redirects=True,
-                verify=False  # Disable SSL verification for performance
-            ) as client:
+            # Create a client for this request
+            client_args = {
+                "timeout": timeout,
+                "follow_redirects": True,
+                "http2": False  # Disable HTTP2 for compatibility
+            }
+            
+            # Add proxy if available
+            if proxy_url:
+                client_args["proxy"] = proxy_url
+                
+            async with httpx.AsyncClient(**client_args) as client:
                 response = await client.get(url, headers=headers)
+                
                 response.raise_for_status()
                 content = response.text
                 elapsed = time.time() - start_time
+                
+                logger.info(f"Successfully scraped {url} in {elapsed:.2f} seconds")
                 
                 return {
                     "url": url,
@@ -75,17 +87,13 @@ async def scrape_url(url: str, max_retries: int = 3, timeout: int = 30, proxy_ty
                     "content": content,
                     "elapsed_seconds": elapsed,
                     "success": True,
-                    "proxy_used": "datacenter",  # Always reporting datacenter
+                    "proxy_used": "datacenter" if proxy_url else "none",
                 }
         except httpx.TimeoutException:
-            logger.warning(f"Attempt {attempt+1} timed out for {url}")
-            # Get a different proxy for the retry
+            logger.warning(f"Attempt {attempt+1}/{max_retries} timed out for {url}")
+            # Get a different proxy for the retry if available
             if proxies:
                 proxy_url = random.choice(proxies)
-                proxy = {
-                    "http://": proxy_url,
-                    "https://": proxy_url
-                }
             
             # If this was the last attempt, return error
             if attempt == max_retries - 1:
@@ -95,60 +103,55 @@ async def scrape_url(url: str, max_retries: int = 3, timeout: int = 30, proxy_ty
                     "error": "All retry attempts timed out",
                     "elapsed_seconds": elapsed,
                     "success": False,
-                    "proxy_used": "datacenter",
+                    "proxy_used": "datacenter" if proxy_url else "none",
                 }
         except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code
             # Don't retry for client errors (4xx)
-            if 400 <= e.response.status_code < 500:
+            if 400 <= status_code < 500:
                 elapsed = time.time() - start_time
                 return {
                     "url": url,
-                    "status_code": e.response.status_code,
+                    "status_code": status_code,
                     "error": f"HTTP error: {e}",
                     "elapsed_seconds": elapsed,
                     "success": False,
-                    "proxy_used": "datacenter",
+                    "proxy_used": "datacenter" if proxy_url else "none",
                 }
             # Server errors might be transient, continue retrying
-            logger.warning(f"Attempt {attempt+1} failed with HTTP error {e.response.status_code} for {url}")
-            # Get a different proxy for the retry
+            logger.warning(f"Attempt {attempt+1}/{max_retries} failed with HTTP error {status_code} for {url}")
+            
+            # Get a different proxy for the retry if available
             if proxies:
                 proxy_url = random.choice(proxies)
-                proxy = {
-                    "http://": proxy_url,
-                    "https://": proxy_url
-                }
             
             # If this was the last attempt, return error
             if attempt == max_retries - 1:
                 elapsed = time.time() - start_time
                 return {
                     "url": url,
-                    "status_code": e.response.status_code,
+                    "status_code": status_code,
                     "error": f"All retry attempts failed with HTTP errors: {e}",
                     "elapsed_seconds": elapsed,
                     "success": False,
-                    "proxy_used": "datacenter",
+                    "proxy_used": "datacenter" if proxy_url else "none",
                 }
         except Exception as e:
-            logger.warning(f"Attempt {attempt+1} failed with unexpected error for {url}: {e}")
-            # Get a different proxy for the retry
+            logger.warning(f"Attempt {attempt+1}/{max_retries} failed with unexpected error for {url}: {e}")
+            
+            # Get a different proxy for the retry if available
             if proxies:
                 proxy_url = random.choice(proxies)
-                proxy = {
-                    "http://": proxy_url,
-                    "https://": proxy_url
-                }
             
             # If this was the last attempt, return error
             if attempt == max_retries - 1:
                 elapsed = time.time() - start_time
                 return {
                     "url": url,
-                    "error": f"All retry attempts failed with unexpected errors: {e}",
+                    "error": f"All retry attempts failed with unexpected errors: {str(e)}",
                     "elapsed_seconds": elapsed,
                     "success": False,
-                    "proxy_used": "datacenter",
+                    "proxy_used": "datacenter" if proxy_url else "none",
                 }
     
     # This should never happen, but added for completeness
@@ -158,7 +161,7 @@ async def scrape_url(url: str, max_retries: int = 3, timeout: int = 30, proxy_ty
         "error": "Unknown failure in retry logic",
         "elapsed_seconds": elapsed,
         "success": False,
-        "proxy_used": "datacenter",
+        "proxy_used": "datacenter" if proxy_url else "none",
     }
 
 @app.post("/scrape")
@@ -169,12 +172,13 @@ async def scrape_urls(request: ScrapeRequest) -> Dict[str, Any]:
     
     start_time = time.time()
     
-    # For now, we always use datacenter proxies regardless of what is requested
-    proxy_type = "datacenter"
-    logger.info(f"Using {proxy_type} proxies for scraping {len(request.urls)} URLs")
+    # Log the number of proxies available
+    proxies = get_proxy_list()
+    proxy_count = len(proxies)
+    logger.info(f"Using {proxy_count} datacenter proxies for scraping {len(request.urls)} URLs")
     
     # Create tasks for each URL
-    tasks = [scrape_url(url, proxy_type=proxy_type) for url in request.urls]
+    tasks = [scrape_url(url) for url in request.urls]
     
     # Execute all tasks concurrently
     results = await asyncio.gather(*tasks)
@@ -192,10 +196,10 @@ async def scrape_urls(request: ScrapeRequest) -> Dict[str, Any]:
         "successful": successful,
         "failed": failed,
         "total_time_seconds": total_time,
-        "proxy_type_used": proxy_type
+        "proxy_type_used": "datacenter"
     }
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "version": get_settings().app_version}
+    return {"status": "healthy", "version": os.getenv("APP_VERSION", "0.1.0")}
